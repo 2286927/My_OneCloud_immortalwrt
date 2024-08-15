@@ -1,0 +1,223 @@
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+#
+# File: .github/workflows/openwrt-bulder.yml
+# Description: Build OpenWrt using GitHub Actions
+#
+# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+
+name: Immortalwrt Builder
+
+permissions: write-all
+# 开启写权限，防止无法上传到release
+
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+
+env:
+  #REPO_URL: https://github.com/coolsnowwolf/lede
+  #REPO_BRANCH: master
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: Config/onecloud.config
+  DIY_P1_SH: sh/diy-part1.sh
+  DIY_P2_SH: sh/diy-part2.sh
+  DIY_P3_SH: sh/remove.sh
+  #GEN_BURN_IMG_SH: gen_burn_img.sh
+  OWRT_IP: 172.16.8.1
+  OWRT_NAME: OneCloud
+  OWRT_FILES: onecloud/files
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: 释放磁盘空间
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: false
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo sed -i 's/azure\.//' /etc/apt/sources.list
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install $(cat $GITHUB_WORKSPACE/Ubuntu-2204.txt)
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        
+    - name: 初始化变量
+      run: |
+          echo "OWRT_FILES=$OWRT_FILES" >> $GITHUB_ENV
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        
+        cd openwrt
+        if [[ $REPO_URL == *"immortalwrt"* ]]; then
+          mv $GITHUB_WORKSPACE/lede6.6/target/linux/amlogic target/linux/amlogic
+          chmod -Rf 755 target/linux/amlogic
+        fi
+
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+        echo "COMMIT_HASH=$(git rev-parse HEAD)" >> $GITHUB_ENV
+ 
+    - name: 启动缓存[第二次起生效]
+      uses: rmoyulong/cachewrtbuild@main
+      with:
+        ccache: 'true'
+        prefix: ${{ github.workspace }}/openwrt
+        mixkey: ${{ env.OWRT_URL }}/tree/${{ env.OWRT_BRANCH }}?device=${{ env.OWRT_CFG }}
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        chmod +x $DIY_P3_SH
+        cd openwrt
+        cp -rf $GITHUB_WORKSPACE/ax6/banner package/base-files/files/etc/banner
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+        #删除冲突的插件 
+        $GITHUB_WORKSPACE/sh/remove.sh
+
+    - name: 自定义IMAGS格式 - meson8b cortex-a5+vfpv4
+      run: |
+        dos2unix $GITHUB_WORKSPACE/$OWRT_FILES/etc/*.sh
+        dos2unix $GITHUB_WORKSPACE/$OWRT_FILES/etc/rc.*
+        chmod -Rf 755 $GITHUB_WORKSPACE/$OWRT_FILES/etc/*.sh
+        chmod -Rf 755 $GITHUB_WORKSPACE/$OWRT_FILES/etc/rc.*
+        
+        cp -rf $GITHUB_WORKSPACE/$OWRT_FILES/* openwrt/files
+        echo $GITHUB_WORKSPACE/$OWRT_FILES
+        
+        cd openwrt && make defconfig
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +"%Y-%m-%d %H%M")" >> $GITHUB_ENV
+        echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+        echo "TAG_DATE=$(date +"%m%d-%H%M%S")" >> $GITHUB_ENV
+
+    - name: 生成直刷包
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        #cp -rf bin/targets/*/*/*.gz ./outfile
+        curl -L -o ./AmlImg https://github.com/rmoyulong/AmlImg/releases/download/$ver/AmlImg_${ver}_linux_amd64
+        curl -L -o ./uboot.img https://github.com/rmoyulong/u-boot-onecloud/releases/download/Onecloud_Uboot_23.12.24_22.17.50/eMMC.burn.img
+        curl -L -o ./gen_burn_img.sh https://github.com/xydche/onecloud-openwrt/raw/main/gen_burn_img.sh
+        chmod +x gen_burn_img.sh
+        chmod +x AmlImg
+        chmod +x uboot.img
+        $GITHUB_WORKSPACE/gen_burn_img.sh
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+  
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages feeds.buildinfo version.buildinfo sha256sums profiles.json *.sha *.manifest
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Upload OpenWrt Firmware to Release
+      uses: ncipollo/release-action@v1
+      with:
+        name: OneCloud-immortalwrt ${{ env.PRODUCT_NAME }}${{ env.DATE }}
+        tag: OneCloud-immortalwrt${{ env.TAG_DATE }}
+        artifacts: ${{ env.FIRMWARE }}/*
+        allowUpdates: true
+        removeArtifacts: true
+        token: ${{ secrets.GITHUB_TOKEN }}
+        body: |
+         玩客云固件[amlogic6.6]！
+          =============基本信息============
+          
+          * 玩客云OneCloud
+          * ${{env.OWRT_SOURCE}}
+          * ${{env.OWRT_IP}}
+          * ByZhou-Cy-onecloud卡刷包[amlogic6.6]
+          * Default username: root
